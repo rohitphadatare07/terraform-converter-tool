@@ -23,11 +23,13 @@ def writer_agent(state: ConversionState) -> ConversionState:
         except Exception as exc:
             state.errors.append(f"Writer: could not write {dest} – {exc}")
 
-    # ── Write supporting files ─────────────────────────────────────────
-    _write_if_content(output_dir / "provider.tf",   state.provider_tf)
-    _write_if_content(output_dir / "variables.tf",  state.variables_tf)
-    _write_if_content(output_dir / "outputs.tf",    state.outputs_tf)
-    _write_if_content(output_dir / "backend.tf",    state.backend_tf)
+    # ── Write supporting files (named for the target cloud) ───────────────
+    direction = get_direction(state.direction)
+    suffix = direction.output_suffix  # e.g. "_aws", "_gcp", "_azure"
+    _write_if_content(output_dir / "provider.tf",                state.provider_tf)
+    _write_if_content(output_dir / f"variables{suffix}.tf",      state.variables_tf)
+    _write_if_content(output_dir / f"outputs{suffix}.tf",        state.outputs_tf)
+    _write_if_content(output_dir / "backend.tf",                 state.backend_tf)
 
     # ── Write README ───────────────────────────────────────────────────
     _write_if_content(output_dir / "README.md", _build_readme(state))
