@@ -1,5 +1,6 @@
 """
 Graph state shared across all LangGraph nodes.
+Now direction-aware: works for any cloud-to-cloud conversion.
 """
 from typing import Annotated, Any, Dict, List, Optional
 from pydantic import BaseModel, Field
@@ -11,15 +12,15 @@ class FileInfo(BaseModel):
     path: str
     relative_path: str
     content: str
-    file_type: str          # e.g. "terraform", "yaml", "json"
-    resource_types: List[str] = Field(default_factory=list)  # GCP resource types found
+    file_type: str
+    resource_types: List[str] = Field(default_factory=list)
 
 
 class ConvertedFile(BaseModel):
-    """Represents a successfully converted AWS Terraform file."""
+    """Represents a successfully converted IaC file."""
     source_path: str
     output_path: str
-    aws_content: str
+    aws_content: str        # kept as 'aws_content' for backward compat; holds target IaC
     resources_converted: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
     notes: str = ""
@@ -27,47 +28,50 @@ class ConvertedFile(BaseModel):
 
 class ConversionState(BaseModel):
     """
-    The shared state that flows through every LangGraph node.
-
-    Annotated fields with operator.add are automatically merged
-    when multiple nodes update them in parallel branches.
+    Shared state flowing through every LangGraph node.
+    All conversion directions use the same state shape.
     """
 
     # ── Input ──────────────────────────────────────────────────────────
-    source_dir: str = ""                        # Root directory of GCP IaC
-    output_dir: str = ""                        # Where to write AWS Terraform
-    provider: str = "openai"                    # LLM provider
-    model: Optional[str] = None                 # LLM model override
-    api_key: Optional[str] = None              # LLM API key
+    source_dir: str = ""
+    output_dir: str = ""
 
-    # ── Discovery phase ────────────────────────────────────────────────
+    # Direction: one of gcp-aws, aws-gcp, gcp-azure, azure-gcp, azure-aws, aws-azure
+    direction: str = "gcp-aws"
+
+    # LLM config
+    provider: str = "openai"
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+
+    # ── Discovery ──────────────────────────────────────────────────────
     discovered_files: List[FileInfo] = Field(default_factory=list)
     total_files: int = 0
     skipped_files: List[str] = Field(default_factory=list)
 
-    # ── Analysis phase ─────────────────────────────────────────────────
+    # ── Analysis ───────────────────────────────────────────────────────
     gcp_resource_summary: Dict[str, Any] = Field(default_factory=dict)
     resource_dependency_map: Dict[str, List[str]] = Field(default_factory=dict)
     conversion_plan: str = ""
 
-    # ── Conversion phase ───────────────────────────────────────────────
-    # Annotated so parallel nodes can safely append to this list
+    # ── Conversion ─────────────────────────────────────────────────────
     converted_files: Annotated[List[ConvertedFile], operator.add] = Field(
         default_factory=list
     )
     failed_files: Annotated[List[str], operator.add] = Field(default_factory=list)
 
     # ── Post-processing ────────────────────────────────────────────────
-    variables_tf: str = ""          # Consolidated variables.tf
-    outputs_tf: str = ""            # Consolidated outputs.tf
-    provider_tf: str = ""           # AWS provider block
-    backend_tf: str = ""            # Optional remote backend config
+    variables_tf: str = ""
+    outputs_tf: str = ""
+    provider_tf: str = ""
+    backend_tf: str = ""
 
     # ── Summary ────────────────────────────────────────────────────────
     conversion_report: str = ""
     errors: Annotated[List[str], operator.add] = Field(default_factory=list)
     warnings: Annotated[List[str], operator.add] = Field(default_factory=list)
-    status: str = "pending"         # pending | running | completed | failed
+    status: str = "pending"
 
     class Config:
         arbitrary_types_allowed = True

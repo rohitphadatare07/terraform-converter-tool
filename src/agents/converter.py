@@ -1,7 +1,7 @@
 """
-Agent 3 – Terraform Converter
-Converts each discovered GCP IaC file into AWS Terraform HCL.
-Runs once per file; the LangGraph runner calls this node for each FileInfo.
+Agent 3 – IaC Converter
+Direction-aware: builds system prompt and convert prompt dynamically
+from the conversion direction and resource mapping table.
 """
 import re
 from pathlib import Path
@@ -10,66 +10,30 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.graph.state import ConversionState, ConvertedFile
 from src.llm.factory import get_llm
+from src.llm.call import llm_call, strip_markdown_fences
+from src.directions import get_direction
+from src.mappings import mapping_to_prompt_text
 
-SYSTEM_PROMPT = """You are a senior DevOps/Cloud engineer specialising in cloud infrastructure
-migration. You convert GCP (Google Cloud Platform) Infrastructure-as-Code into AWS Terraform.
+SYSTEM_PROMPT_TEMPLATE = """You are a senior DevOps/Cloud engineer specialising in
+multi-cloud infrastructure migration.
+
+Task: Convert {source_label} Infrastructure-as-Code to {target_label} Terraform HCL.
 
 Rules:
-1. Output ONLY valid HCL Terraform code – no explanations, no markdown fences.
-2. Replace every GCP resource with its closest AWS equivalent.
-3. Preserve resource naming conventions as much as possible.
-4. Use Terraform best practices: variables for repeated values, locals for computed values.
+1. Output ONLY valid HCL Terraform – no explanations, no markdown fences.
+2. Replace every {source_cloud} resource with its {target_cloud} equivalent.
+3. Preserve logical naming conventions.
+4. Use Terraform best practices: variables, locals, data sources.
 5. Add inline comments (# ...) where the mapping is non-trivial.
-6. If a GCP resource has no direct AWS equivalent, create a commented stub and add a TODO.
-7. Do NOT include the provider block – that is handled separately.
-8. Use var.aws_region, var.aws_account_id, var.project_name as standard variables.
+6. If a resource has no direct equivalent, create a commented stub with a TODO.
+7. Do NOT include the provider block – generated separately.
+8. Use the standard variables: {standard_vars}
 
-GCP → AWS mapping reminders:
-  google_compute_instance        → aws_instance
-  google_compute_network         → aws_vpc
-  google_compute_subnetwork      → aws_subnet
-  google_compute_firewall        → aws_security_group
-  google_compute_router          → aws_route_table / aws_internet_gateway
-  google_compute_global_address  → aws_eip / aws_lb
-  google_container_cluster       → aws_eks_cluster
-  google_container_node_pool     → aws_eks_node_group
-  google_sql_database_instance   → aws_db_instance (RDS)
-  google_sql_database            → aws_db_instance (database param)
-  google_storage_bucket          → aws_s3_bucket
-  google_bigquery_dataset        → aws_glue_catalog_database or aws_athena_*
-  google_bigquery_table          → aws_glue_catalog_table
-  google_pubsub_topic            → aws_sns_topic
-  google_pubsub_subscription     → aws_sqs_queue + aws_sns_topic_subscription
-  google_cloud_run_service       → aws_ecs_service (Fargate) or aws_lambda_function
-  google_cloudfunctions_function → aws_lambda_function
-  google_iam_member              → aws_iam_role_policy_attachment / aws_iam_policy
-  google_project_iam_binding     → aws_iam_policy
-  google_kms_key_ring            → aws_kms_key
-  google_kms_crypto_key          → aws_kms_key (alias)
-  google_secret_manager_secret   → aws_secretsmanager_secret
-  google_dns_managed_zone        → aws_route53_zone
-  google_dns_record_set          → aws_route53_record
-  google_redis_instance          → aws_elasticache_replication_group
-  google_artifact_registry_repo  → aws_ecr_repository
-  google_logging_metric          → aws_cloudwatch_log_metric_filter
-  google_monitoring_alert_policy → aws_cloudwatch_metric_alarm
-  google_cloudfunctions2_function → aws_lambda_function (with eventbridge trigger)
-  google_cloudfunctions_function → aws_lambda_function (with appropriate trigger based on event type)
-  google_compute_disk             → aws_ebs_volume
-  google_compute_image            → aws_ami (imported or from marketplace)
-  google_compute_instance_group   → aws_autoscaling_group
-  google_compute_instance_template → aws_launch_template
-  google_compute_instance_from_template → aws_autoscaling_group with launch template
-  google_compute_managed_ssl_certificate → aws_acm_certificate
-  google_compute_ssl_certificate         → aws_acm_certificate
-  google_compute_target_https_proxy      → aws_lb_listener (with certificate)
-  google_compute_url_map                → aws_lb_listener_rule
-  google_compute_backend_service        → aws_lb_target_group
-  google_compute_health_check          → aws_lb_target_group health_check
-  google_compute_forwarding_rule        → aws_lb_listener + aws_lb_target_group
+{source_cloud} → {target_cloud} resource mapping:
+{mapping_table}
 """
 
-CONVERT_PROMPT = """Convert the following GCP IaC file to AWS Terraform HCL.
+CONVERT_PROMPT_TEMPLATE = """Convert the following {source_cloud} IaC file to {target_cloud} Terraform HCL.
 
 Source file: {relative_path}
 File type: {file_type}
@@ -78,93 +42,93 @@ File type: {file_type}
 {content}
 --- END SOURCE ---
 
-Context from overall infrastructure analysis:
+Conversion plan context:
 {conversion_plan}
 
-Output ONLY the converted Terraform HCL (no markdown, no backticks):
+Output ONLY the converted Terraform HCL:
 """
 
 
-def _extract_aws_resources(hcl: str):
-    """Return a list of AWS resource type strings found in the HCL."""
-    return list(set(re.findall(r'resource\s+"(aws_[^"]+)"', hcl)))
+def _extract_target_resources(hcl: str, target_provider: str) -> list:
+    """Extract target resource type strings from HCL output."""
+    pattern = rf'resource\s+"({re.escape(target_provider)}_[^"]+)"'
+    return list(set(re.findall(pattern, hcl)))
 
 
-def _derive_output_path(relative_path: str, output_dir: str) -> str:
-    """
-    Mirror the source directory structure under output_dir.
-    Rename files to make clear they are AWS resources.
-    """
+def _derive_output_path(relative_path: str, output_dir: str, suffix: str) -> str:
+    """Mirror source directory structure; append direction suffix to filename."""
     p = Path(relative_path)
-    # Keep directory structure, suffix stays .tf
-    new_name = p.stem + "_aws" + ".tf"
-    out = Path(output_dir) / p.parent / new_name
-    return str(out)
+    new_name = p.stem + suffix + ".tf"
+    return str(Path(output_dir) / p.parent / new_name)
 
 
 def converter_agent(state: ConversionState) -> ConversionState:
-    """
-    LangGraph node: convert ALL discovered files.
-    Each file is converted independently so failures are isolated.
-    """
+    """LangGraph node: convert all discovered files to target cloud Terraform."""
     if not state.discovered_files:
         return state
+
+    direction = get_direction(state.direction)
+    mapping_table = mapping_to_prompt_text(state.direction)
+    standard_vars = ", ".join(f"var.{v}" for v in direction.standard_vars)
+
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        source_label=direction.source_label,
+        target_label=direction.target_label,
+        source_cloud=direction.source_cloud,
+        target_cloud=direction.target_cloud,
+        standard_vars=standard_vars,
+        mapping_table=mapping_table,
+    )
 
     llm = get_llm(
         provider=state.provider,
         model=state.model,
         api_key=state.api_key,
+        base_url=state.base_url,
     )
 
-    converted: list[ConvertedFile] = []
-    failed: list[str] = []
+    converted = []
+    failed = []
 
     for file_info in state.discovered_files:
         try:
+            convert_prompt = CONVERT_PROMPT_TEMPLATE.format(
+                source_cloud=direction.source_cloud,
+                target_cloud=direction.target_cloud,
+                relative_path=file_info.relative_path,
+                file_type=file_info.file_type,
+                content=file_info.content[:8000],
+                conversion_plan=state.conversion_plan[:2000],
+            )
+
             messages = [
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(
-                    content=CONVERT_PROMPT.format(
-                        relative_path=file_info.relative_path,
-                        file_type=file_info.file_type,
-                        content=file_info.content[:8000],  # safety truncation
-                        conversion_plan=state.conversion_plan[:2000],
-                    )
-                ),
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=convert_prompt),
             ]
 
-            response = llm.invoke(messages)
-            aws_content = response.content.strip()
+            response = llm_call(llm, messages)
+            target_content = strip_markdown_fences(response)
 
-            # Strip any accidental markdown fences
-            if aws_content.startswith("```"):
-                parts = aws_content.split("```")
-                # parts[1] contains the code
-                aws_content = parts[1]
-                if aws_content.startswith("hcl") or aws_content.startswith("terraform"):
-                    aws_content = "\n".join(aws_content.splitlines()[1:])
-                aws_content = aws_content.strip()
+            # Strip accidental leading language hint lines
+            first_line = target_content.split("\n")[0].strip().lower()
+            if first_line in ("hcl", "terraform", "tf", "bicep"):
+                target_content = "\n".join(target_content.split("\n")[1:]).strip()
 
             output_path = _derive_output_path(
-                file_info.relative_path, state.output_dir
+                file_info.relative_path, state.output_dir, direction.output_suffix
             )
-            resources = _extract_aws_resources(aws_content)
+            resources = _extract_target_resources(target_content, direction.target_provider)
 
-            converted.append(
-                ConvertedFile(
-                    source_path=file_info.path,
-                    output_path=output_path,
-                    aws_content=aws_content,
-                    resources_converted=resources,
-                )
-            )
+            converted.append(ConvertedFile(
+                source_path=file_info.path,
+                output_path=output_path,
+                aws_content=target_content,
+                resources_converted=resources,
+            ))
 
         except Exception as exc:
-            failed.append(
-                f"{file_info.relative_path}: {exc}"
-            )
+            failed.append(f"{file_info.relative_path}: {exc}")
 
-    # Use list concat (annotated with operator.add) via direct assignment
     state.converted_files = state.converted_files + converted
     state.failed_files = state.failed_files + failed
     return state

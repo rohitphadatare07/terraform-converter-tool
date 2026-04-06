@@ -1,7 +1,7 @@
 """
-Agent 2 – GCP Infrastructure Analyzer
-Uses the LLM to analyse discovered files, build a resource summary,
-and produce a conversion plan before any code is generated.
+Agent 2 – Infrastructure Analyzer
+Direction-aware: builds analysis prompt dynamically from the
+conversion direction and resource mapping table.
 """
 import json
 from typing import Any, Dict
@@ -10,33 +10,41 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.graph.state import ConversionState
 from src.llm.factory import get_llm
+from src.llm.call import llm_call, strip_markdown_fences
+from src.directions import get_direction
+from src.mappings import mapping_to_prompt_text
 
-SYSTEM_PROMPT = """You are an expert cloud infrastructure architect with deep knowledge of
-both Google Cloud Platform (GCP) and Amazon Web Services (AWS). Your task is to analyze
-GCP Infrastructure-as-Code (IaC) and produce a structured migration analysis.
+SYSTEM_PROMPT = """You are an expert cloud infrastructure architect specialising in
+multi-cloud migrations. Your task is to analyze Infrastructure-as-Code (IaC) files
+and produce a structured migration analysis in JSON.
 
-Always respond with valid JSON. No markdown, no explanation outside the JSON object."""
+Always respond with valid JSON only. No markdown, no explanation outside the JSON."""
 
-ANALYSIS_PROMPT = """Analyze the following GCP infrastructure files and return a JSON object with:
+ANALYSIS_PROMPT = """You are converting {source_label} IaC to {target_label} Terraform.
+
+Resource mapping reference ({source_cloud} → {target_cloud}):
+{mapping_table}
+
+Analyze the following source files and return a JSON object:
 
 {{
   "resource_summary": {{
-    "<gcp_resource_type>": {{
+    "<source_resource_type>": {{
       "count": <int>,
-      "aws_equivalent": "<aws_resource_type>",
+      "target_equivalent": "<target_resource_type>",
       "conversion_complexity": "simple|moderate|complex",
-      "notes": "<any important migration notes>"
+      "notes": "<migration notes>"
     }}
   }},
   "dependencies": {{
-    "<resource_name>": ["<depends_on_resource_1>", "..."]
+    "<resource_name>": ["<depends_on_1>", "..."]
   }},
-  "conversion_plan": "<detailed step-by-step conversion strategy as a string>",
-  "estimated_aws_resources": ["<list of AWS resource types that will be created>"],
-  "risks": ["<list of migration risks or caveats>"]
+  "conversion_plan": "<detailed step-by-step strategy>",
+  "estimated_target_resources": ["<list of target resource types>"],
+  "risks": ["<migration risks or caveats>"]
 }}
 
-Files to analyze:
+Source files:
 ---
 {files_summary}
 ---
@@ -44,13 +52,11 @@ Files to analyze:
 
 
 def _build_files_summary(state: ConversionState) -> str:
-    """Build a compact text summary of all discovered files for the LLM prompt."""
     lines = []
     for f in state.discovered_files:
         lines.append(f"### File: {f.relative_path} (type: {f.file_type})")
         if f.resource_types:
-            lines.append(f"GCP resources found: {', '.join(f.resource_types)}")
-        # Include up to 200 lines of content to stay within context limits
+            lines.append(f"Resources found: {', '.join(f.resource_types)}")
         content_lines = f.content.splitlines()[:200]
         lines.append("```")
         lines.extend(content_lines)
@@ -61,39 +67,38 @@ def _build_files_summary(state: ConversionState) -> str:
 
 
 def analyzer_agent(state: ConversionState) -> ConversionState:
-    """
-    LangGraph node: analyse all discovered GCP files and produce a plan.
-    """
+    """LangGraph node: analyse discovered files and produce a conversion plan."""
     if not state.discovered_files:
         state.warnings.append("Analyzer skipped – no files to analyse.")
         return state
+
+    direction = get_direction(state.direction)
 
     llm = get_llm(
         provider=state.provider,
         model=state.model,
         api_key=state.api_key,
+        base_url=state.base_url,
     )
 
     files_summary = _build_files_summary(state)
+    mapping_table = mapping_to_prompt_text(state.direction)
 
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(
-            content=ANALYSIS_PROMPT.format(files_summary=files_summary)
-        ),
+        HumanMessage(content=ANALYSIS_PROMPT.format(
+            source_label=direction.source_label,
+            target_label=direction.target_label,
+            source_cloud=direction.source_cloud,
+            target_cloud=direction.target_cloud,
+            mapping_table=mapping_table,
+            files_summary=files_summary,
+        )),
     ]
 
     try:
-        response = llm.invoke(messages)
-        raw = response.content.strip()
-
-        # Strip possible markdown fences
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-
+        raw = llm_call(llm, messages)
+        raw = strip_markdown_fences(raw)
         data: Dict[str, Any] = json.loads(raw)
 
         state.gcp_resource_summary = data.get("resource_summary", {})
