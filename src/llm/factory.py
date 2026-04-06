@@ -92,10 +92,10 @@ def get_llm(
     #  Ollama (local models)                                               #
     # ------------------------------------------------------------------ #
     elif provider == "ollama":
-        try:
-            from langchain_ollama import ChatOllama
-        except ImportError:
-            from langchain_community.chat_models import ChatOllama  # type: ignore
+        # try:
+        from langchain_ollama import ChatOllama
+        # except ImportError:
+        #     from langchain_community.chat_models import ChatOllama  # type: ignore
 
         return ChatOllama(
             model=model or "codellama:13b",
