@@ -199,12 +199,13 @@ def convert(source, output, direction, provider, model, api_key, verbose):
     )
 
     step_map = {
-        "scanner":       f"🔍  Scanning {d.source_label} source files…",
-        "analyzer":      f"🧠  Analysing {d.source_cloud} infrastructure…",
-        "converter":     f"⚙️   Converting {d.source_cloud} → {d.target_cloud} Terraform…",
-        "postprocessor": f"📦  Generating {d.target_cloud} provider/variables/outputs…",
-        "writer":        "💾  Writing output files…",
-        "reporter":      "📋  Building conversion report…",
+        "scanner":               f"🔍  Scanning {d.source_label} source files…",
+        "project_understanding": f"🧩  Understanding project structure and variable wiring…",
+        "analyzer":              f"🧠  Analysing {d.source_cloud} infrastructure…",
+        "converter":             f"⚙️   Converting {d.source_cloud} → {d.target_cloud} Terraform…",
+        "postprocessor":         f"📦  Generating {d.target_cloud} provider/variables/outputs…",
+        "writer":                "💾  Writing output files…",
+        "reporter":              "📋  Building conversion report…",
     }
 
     with Progress(
