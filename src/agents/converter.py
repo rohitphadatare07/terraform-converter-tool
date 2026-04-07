@@ -494,25 +494,59 @@ def converter_agent(state: ConversionState) -> ConversionState:
     converted = []
     failed = []
 
-    # Separate files by role
-    resource_files, variables_files, outputs_files = [], [], []
-    root_main_files, passthrough_files = [], []
+    # ── Classify files by role and project type ───────────────────────
+    #
+    # Flat project (no modules/ dir):
+    #   main.tf / *.tf with resources → Pass 1 (resource conversion)
+    #   variables.tf                  → Pass 2 (regenerate)
+    #   outputs.tf                    → Pass 3 (regenerate)
+    #   provider.tf / backend.tf      → Pass 5 (passthrough)
+    #
+    # Module project (modules/ dir present):
+    #   modules/*/main.tf             → Pass 1 (resource conversion per module)
+    #   modules/*/variables.tf        → Pass 2 (regenerate per module)
+    #   modules/*/outputs.tf          → Pass 3 (regenerate per module)
+    #   terraform/main.tf (root)      → Pass 4 (update module call variable names)
+    #   terraform/variables.tf (root) → Pass 2 (root-level variables regenerated)
+    #   terraform/outputs.tf (root)   → Pass 3 (root-level outputs regenerated)
+    #   provider.tf / backend.tf      → Pass 5 (passthrough)
+
+    resource_files   = []   # main.tf and resource files (all modules + flat root)
+    variables_files  = []   # all variables.tf files (modules + root)
+    outputs_files    = []   # all outputs.tf files (modules + root)
+    root_main_files  = []   # root main.tf only (module projects — has module{} blocks)
+    passthrough_files = []  # provider, backend, tfvars
 
     for f in state.discovered_files:
         is_root = (f.module_name == "root")
+
         if f.file_role in ("resource", "main"):
             if is_root and state.is_module_project:
+                # Root main.tf in a module project calls sub-modules —
+                # needs wiring-map treatment in Pass 4, not resource conversion
                 root_main_files.append(f)
             else:
+                # Module main.tf files AND root main.tf in flat projects
                 resource_files.append(f)
+
         elif f.file_role == "variables":
+            # All variables.tf files — both root and module-level
+            # In flat projects: root variables.tf regenerated based on converted main
+            # In module projects: each module's variables.tf regenerated independently
             variables_files.append(f)
+
         elif f.file_role == "outputs":
+            # All outputs.tf files — both root and module-level
             outputs_files.append(f)
+
         else:
+            # provider.tf, backend.tf, .tfvars — passed through with provider swap
             passthrough_files.append(f)
 
-    # ── Pass 1: Convert resource/main files ───────────────────────────
+    # ── Pass 1: Convert resource/main.tf files ────────────────────────
+    # Flat project:   converts root main.tf resource blocks
+    # Module project: converts each modules/*/main.tf resource blocks
+    # Result stored in converted_mains[module_name] for Passes 2 & 3
     converted_mains: Dict[str, str] = {}
     for f in resource_files:
         try:
@@ -520,14 +554,23 @@ def converter_agent(state: ConversionState) -> ConversionState:
             cf = _convert_resource_file(f, direction, mapping_str, mod_u,
                                          llm, state.output_dir, suffix)
             converted.append(cf)
-            converted_mains[f.module_name] = cf.aws_content
+            # Store converted content indexed by module name so Pass 2/3 can find it
+            if f.module_name not in converted_mains:
+                converted_mains[f.module_name] = cf.aws_content
+            else:
+                converted_mains[f.module_name] += "\n" + cf.aws_content
         except Exception as exc:
             failed.append(f"{f.relative_path}: {exc}")
 
-    # ── Pass 2: Regenerate variables.tf using understanding map ────────
+    # ── Pass 2: Regenerate variables.tf ──────────────────────────────
+    # For each variables.tf found (module or root), regenerate it using:
+    #   - The understanding map's variable name mappings for that module
+    #   - The converted main.tf for that same module as reference
+    # This guarantees variable names match what the converted main.tf uses
     for f in variables_files:
         try:
             mod_u = _get_module_understanding(understanding, f.module_name)
+            # Use converted main as reference; fall back to original if not converted yet
             main_content = converted_mains.get(f.module_name, f.content)
             cf = _convert_variables_file(f, main_content, mod_u, direction,
                                           llm, state.output_dir)
@@ -535,7 +578,11 @@ def converter_agent(state: ConversionState) -> ConversionState:
         except Exception as exc:
             failed.append(f"{f.relative_path} (variables): {exc}")
 
-    # ── Pass 3: Regenerate outputs.tf using understanding map ──────────
+    # ── Pass 3: Regenerate outputs.tf ────────────────────────────────
+    # For each outputs.tf found (module or root), regenerate it using:
+    #   - The understanding map's output → target_cloud_equivalent mappings
+    #   - The converted main.tf for that same module as reference
+    # This guarantees output values reference actual GCP/Azure resource names
     for f in outputs_files:
         try:
             mod_u = _get_module_understanding(understanding, f.module_name)
@@ -546,7 +593,12 @@ def converter_agent(state: ConversionState) -> ConversionState:
         except Exception as exc:
             failed.append(f"{f.relative_path} (outputs): {exc}")
 
-    # ── Pass 4: Update root main.tf with wiring map ────────────────────
+    # ── Pass 4: Update root main.tf module call blocks ────────────────
+    # Only runs for module-based projects.
+    # The root main.tf calls sub-modules and passes variable values to them.
+    # Since module variable names changed in Pass 2, the root main.tf
+    # must be updated to pass the new variable names.
+    # Uses module_wiring from the understanding map for exact renames.
     for f in root_main_files:
         try:
             cf = _convert_root_main(f, understanding, direction, llm, state.output_dir)
@@ -554,18 +606,9 @@ def converter_agent(state: ConversionState) -> ConversionState:
         except Exception as exc:
             failed.append(f"{f.relative_path} (root main): {exc}")
 
-    # Non-module projects: convert root main.tf as resource file
-    if not state.is_module_project:
-        for f in root_main_files:
-            try:
-                mod_u = _get_module_understanding(understanding, "root")
-                cf = _convert_resource_file(f, direction, mapping_str, mod_u,
-                                             llm, state.output_dir, suffix)
-                converted.append(cf)
-            except Exception as exc:
-                failed.append(f"{f.relative_path}: {exc}")
-
-    # ── Pass 5: Passthrough provider/backend with provider swap ───────
+    # ── Pass 5: Passthrough provider/backend ──────────────────────────
+    # provider.tf and backend.tf have no resource blocks to convert.
+    # Only action: swap the provider name string (aws → google, etc.)
     for f in passthrough_files:
         try:
             content = f.content.replace(
